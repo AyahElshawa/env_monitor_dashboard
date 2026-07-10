@@ -1,0 +1,124 @@
+services:
+
+  # ── 1. MQTT Broker (test broker — swap for the company's later) ────────────
+  mqtt_broker:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt_broker
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    networks:
+      - monitor_net
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-t", "$$SYS/#", "-C", "1", "-W", "3"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ── 2. FastAPI Backend ─────────────────────────────────────────────────────
+  backend_api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: backend_api
+    restart: unless-stopped
+    depends_on:
+      mqtt_broker:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      # Inside Docker the broker is reachable by its SERVICE NAME, never localhost
+      MQTT_BROKER_HOST: mqtt_broker
+      MQTT_BROKER_PORT: "1883"
+      MQTT_TOPIC: "InnoLab/tele/+/SENSOR"
+      MQTT_RECONNECT_DELAY: "5"
+
+      # Payload parsing (Tasmota). Separator is a SLASH, not a dot —
+      # because the field name "PM2.5" already contains a dot.
+      MQTT_SENSOR_SOURCE: topic
+      MQTT_TOPIC_ID_INDEX: "-2"
+      MQTT_VALUE_PATH: "SDS0X1/PM2.5"
+
+      OLLAMA_BASE_URL: https://ollama.wineme.wiwi.uni-siegen.de/api/generate
+      OLLAMA_PRIMARY_MODEL: llama3.1:8b
+      OLLAMA_FALLBACK_MODEL: llama3.2:3b
+      OLLAMA_TIMEOUT: "60"
+
+      DATABASE_URL: sqlite+aiosqlite:////data/env_monitor.db
+
+      # Seed values only — the live thresholds are edited from the dashboard
+      DANGER_THRESHOLD: "50.0"
+      WARNING_THRESHOLD: "25.0"
+
+      AGGREGATION_INTERVAL: "20"
+    volumes:
+      - db_data:/data          # database persists across rebuilds
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - monitor_net
+    # PRODUCTION: no --reload, no bind mount. Code is baked into the image.
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── 3. Streamlit Frontend ──────────────────────────────────────────────────
+  frontend_ui:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend_ui
+    restart: unless-stopped
+    depends_on:
+      backend_api:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    environment:
+      BACKEND_URL: http://backend_api:8000
+      REFRESH_INTERVAL: "20"    # matches AGGREGATION_INTERVAL
+    networks:
+      - monitor_net
+    command: >
+      streamlit run app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+
+  # ── 4. Mock Publisher (test data — NOT started by default) ─────────────────
+  # Start with test data:  docker compose --profile test up -d --build
+  # Stop just this:        docker compose stop mock_publisher
+  mock_publisher:
+    build:
+      context: ./publisher
+      dockerfile: Dockerfile
+    container_name: mock_publisher
+    restart: unless-stopped
+    depends_on:
+      mqtt_broker:
+        condition: service_healthy
+    environment:
+      MQTT_BROKER_HOST: mqtt_broker    # service name — we're inside Docker
+      MQTT_BROKER_PORT: "1883"
+      PUBLISH_INTERVAL: "3"
+      DEVICES: "tasmota_room1,tasmota_room2,tasmota_room3"
+    networks:
+      - monitor_net
+    profiles:
+      - test        # excluded from a plain `docker compose up`
+
+networks:
+  monitor_net:
+    driver: bridge
+
+volumes:
+  db_data:

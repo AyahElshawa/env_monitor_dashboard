@@ -1,0 +1,155 @@
+services:
+
+  # ── 1. MQTT Broker (Eclipse Mosquitto) ─────────────────────────────────────
+  mqtt_broker:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt_broker
+    restart: unless-stopped
+    ports:
+      - "1883:1883"       # Exposed to WSL2 host for direct mosquitto_pub calls
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    networks:
+      - monitor_net
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-t", "$$SYS/#", "-C", "1", "-W", "3"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ── 2. FastAPI Backend ──────────────────────────────────────────────────────
+  backend_api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: backend_api
+    restart: unless-stopped
+    depends_on:
+      mqtt_broker:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      # ── MQTT ──────────────────────────────────────────────────────────────
+      # MUST be the internal Compose service name. The backend runs INSIDE
+      # Docker, so 'localhost' would mean the backend's own container, not the
+      # broker. The broker container is reachable on the network as 'mqtt_broker'.
+      # (Your host-side mock_publisher.py correctly uses 'localhost' instead,
+      # because it runs outside Docker — same broker, different vantage point.)
+      MQTT_BROKER_HOST: mqtt_broker
+      MQTT_BROKER_PORT: "1883"
+      # Tasmota-style topic. The '+' wildcard matches any device ID segment,
+      # e.g. InnoLab/tele/tasmota_room1/SENSOR.
+      MQTT_TOPIC: "InnoLab/tele/+/SENSOR"
+      MQTT_RECONNECT_DELAY: "5"
+
+      # ── Payload parsing (Tasmota format) ───────────────────────────────────
+      # Sensor ID comes from the topic; value is nested under SDS0X1.PM2.5.
+      # When you learn the REAL sensor's particle field, change MQTT_VALUE_PATH.
+      MQTT_SENSOR_SOURCE: topic
+      MQTT_TOPIC_ID_INDEX: "-2"
+      MQTT_VALUE_PATH: "SDS0X1/PM2.5"
+
+      # ── Ollama ─────────────────────────────────────────────────────────────
+      OLLAMA_BASE_URL: https://ollama.wineme.wiwi.uni-siegen.de/api/generate
+      OLLAMA_PRIMARY_MODEL: llama3.1:8b
+      OLLAMA_FALLBACK_MODEL: llama3.2:3b
+      OLLAMA_TIMEOUT: "60"
+
+      # ── Database ───────────────────────────────────────────────────────────
+      DATABASE_URL: sqlite+aiosqlite:////data/env_monitor.db
+
+      # ── Thresholds (seed values only; live values live in the DB now) ──────
+      DANGER_THRESHOLD: "50.0"
+      WARNING_THRESHOLD: "25.0"
+
+      # ── Aggregation: average buffered readings into one row every N seconds ─
+      # 20s chosen deliberately: air quality changes slowly, so this smooths
+      # sensor noise while still surfacing a genuine hazard quickly enough to
+      # act on. Tunable here without touching code.
+      AGGREGATION_INTERVAL: "20"
+    volumes:
+      - db_data:/data
+      - ./backend/main.py:/app/main.py
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - monitor_net
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── 3. Streamlit Frontend ───────────────────────────────────────────────────
+  frontend_ui:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend_ui
+    restart: unless-stopped
+    depends_on:
+      backend_api:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    environment:
+      BACKEND_URL: http://backend_api:8000
+      # Match the dashboard refresh to the backend aggregation interval so the
+      # dashboard updates exactly when new averaged data is available.
+      REFRESH_INTERVAL: "20"
+    volumes:
+      # mount source so frontend edits are live ──────────────
+      - ./frontend/app.py:/app/app.py
+    networks:
+      - monitor_net
+    # (inotify events from bind-mounted volumes are not always delivered)
+    command: >
+      streamlit run app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+      --server.fileWatcherType=poll
+
+  # ── 4. MQTT Simulator (on-demand test publisher) ───────────────────────────
+  mqtt_sim:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt_sim
+    depends_on:
+      mqtt_broker:
+        condition: service_healthy
+    networks:
+      - monitor_net
+    # No restart policy — this is an on-demand run-once service
+    profiles:
+      - tools                 # kept out of `docker compose up` by default
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        MODE=$${1:-danger}
+        SENSOR=$${2:-room1}
+        VALUE=$${3:-}
+        case "$$MODE" in
+          danger)  VALUE=$${VALUE:-72.3} ;;
+          warning) VALUE=$${VALUE:-35.0} ;;
+          normal)  VALUE=$${VALUE:-18.5} ;;
+          custom)  : ;;
+          *)       VALUE=$${VALUE:-72.3} ;;
+        esac
+        PAYLOAD="{\"sensor_id\":\"$$SENSOR\",\"value\":$$VALUE}"
+        echo "Publishing $$PAYLOAD → localhost:1883/sensors/particles"
+        mosquitto_pub -h localhost -p 1883 -t sensors/particles -m "$$PAYLOAD"
+        echo "Done."
+
+# ── Shared network ──────────────────────────────────────────────────────────
+networks:
+  monitor_net:
+    driver: bridge
+
+# ── Named volumes ───────────────────────────────────────────────────────────
+volumes:
+  db_data:
