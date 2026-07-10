@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 import logging
 import os
 import uuid
@@ -22,7 +23,7 @@ from enum import Enum as PyEnum
 from typing import AsyncGenerator, List, Optional
 
 import httpx
-from aiomqtt import Client as MQTTClient, MqttError
+from aiomqtt import Client as MQTTClient, MqttError, TLSParameters
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -47,11 +48,23 @@ MQTT_BROKER_PORT: int = int(os.getenv("MQTT_BROKER_PORT", "1883"))
 MQTT_TOPIC: str = os.getenv("MQTT_TOPIC", "sensors/particles")
 MQTT_RECONNECT_DELAY: float = float(os.getenv("MQTT_RECONNECT_DELAY", "5"))
 
+# ── Broker authentication (leave unset for anonymous brokers) ────────────────
+# If the broker rejects you with "not authorised", set these.
+MQTT_USERNAME: Optional[str] = os.getenv("MQTT_USERNAME") or None
+MQTT_PASSWORD: Optional[str] = os.getenv("MQTT_PASSWORD") or None
+
+# ── TLS (set MQTT_TLS=true for encrypted brokers, usually on port 8883) ──────
+MQTT_TLS: bool = os.getenv("MQTT_TLS", "false").strip().lower() in ("1", "true", "yes")
+# Skip certificate verification (matches the bridge's tls_insecure_set(True)).
+MQTT_TLS_INSECURE: bool = os.getenv("MQTT_TLS_INSECURE", "true").strip().lower() in ("1", "true", "yes")
+
 # ── Payload parsing (configurable so the real sensor format needs no code change) ──
 #
-# VALUE_PATH is a dot-separated path into the JSON to the particulate value.
+# VALUE_PATH is a slash-separated path into the JSON to the particulate value.
 #   Flat test format {"sensor_id":"room1","value":17.3}  → VALUE_PATH = "value"
-#   Tasmota nested   {"Time":...,"SDS0X1":{"PM2.5":12.3}} → VALUE_PATH = "SDS0X1.PM2.5"
+#   Tasmota nested   {"Time":...,"SDS0X1":{"PM2.5":12.3}} → VALUE_PATH = "SDS0X1/PM2.5"
+# A slash (not a dot) separates segments, so field names that contain dots —
+# like Tasmota's "PM2.5" — are not split incorrectly.
 # Once you see the real air-quality payload, set MQTT_VALUE_PATH to the right path.
 MQTT_VALUE_PATH: str = os.getenv("MQTT_VALUE_PATH", "value")
 #
@@ -272,8 +285,12 @@ async def fetch_ollama_explanation(
 def _dig(data: dict, path: str):
     """
     Walk a slash-separated path into nested dicts.
-    _dig({"SDS0X1": {"PM2.5": 12.3}}, "SDS0X1.PM2.5") -> 12.3
-    Returns None if any segment is missing.
+    _dig({"SDS0X1": {"PM2.5": 12.3}}, "SDS0X1/PM2.5") -> 12.3
+
+    A slash (not a dot) is the separator on purpose: real sensor field names
+    often contain dots themselves (e.g. Tasmota's "PM2.5"), so a dot separator
+    would wrongly split "PM2.5" into "PM2" and "5". Returns None if any segment
+    is missing.
     """
     node = data
     for segment in path.split("/"):
@@ -454,12 +471,25 @@ async def mqtt_listener() -> None:
     while True:
         try:
             log.info(
-                "Attempting MQTT connection → %s:%d  topic='%s'",
+                "Attempting MQTT connection → %s:%d  topic='%s'  auth=%s  tls=%s",
                 MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_TOPIC,
+                "yes" if MQTT_USERNAME else "no", MQTT_TLS,
             )
+
+            # Build optional TLS parameters only when TLS is enabled.
+            tls_params = None
+            if MQTT_TLS:
+                tls_params = TLSParameters(
+                    cert_reqs=ssl.CERT_NONE if MQTT_TLS_INSECURE else ssl.CERT_REQUIRED,
+                )
+
             async with MQTTClient(
                 hostname=MQTT_BROKER_HOST,
                 port=MQTT_BROKER_PORT,
+                username=MQTT_USERNAME,      # None → anonymous connection
+                password=MQTT_PASSWORD,
+                tls_params=tls_params,        # None → plain TCP
+                tls_insecure=MQTT_TLS_INSECURE if MQTT_TLS else None,
                 identifier=f"env_monitor_{uuid.uuid4().hex[:8]}",
             ) as client:
                 await client.subscribe(MQTT_TOPIC)
